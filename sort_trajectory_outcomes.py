@@ -1,12 +1,8 @@
-import openbabel
 import numpy as np
 import pandas as pd
 import os
 import glob
 import ntpath
-from scipy.spatial.distance import cdist
-import MDAnalysis as md
-import mdtraj
 
 
 def path_leaf(path):
@@ -175,15 +171,58 @@ def get_geometric_criteria(forward_half_of_traj_cartesians, backward_half_of_tra
     return geometric_criteria_forward, geometric_criteria_backward
 
 
-# TODO: Nov 18 2019 - store these criteria as a dictionary and go through them one by one to make this into a generic function
+def impose_stop_criteria(geoms_forward, geoms_backward, geometric_parameters_list, stop_criteria):
+    """
+    Determines if and when particular products are formed along each half of a trajectory by imposing specific stop
+    criteria, provided as a list.
+    :param geoms_forward: geometric criteria along forward half of trajectory
+    :param geoms_backward: geometric criteria along backward half of trajectory
+    :param geometric_parameters_list: list of the geometric parameters that were measured in geoms_forward and
+    geoms_backward, in the order that they appear in the list
+    :param stop_criteria: dictionary of stop criteria where the keys are the expressions to be evaluated and the values
+    are the structure(s) that are generated
+    :return: record_halves: a record of what was formed first in each trajectory half and when
+    """
 
-def impose_specific_stop_criteria(geoms_forward, geoms_backward, stop_criteria=None):
+    new_criteria = []
+    for b in range(len(list(stop_criteria.keys()))):
+        criterion = list(stop_criteria.keys())[b]
+
+        for a in range(len(geometric_parameters_list)):
+            criterion = criterion.replace(geometric_parameters_list[a], 'geom_half[%s][x]' % a)
+
+        new_criteria.append(criterion)
+
+    # Determine which product was made in each trajectory half
+    record_halves = []
+    for direction, geom_half in zip(('forward', 'backward'), (geoms_forward, geoms_backward)):
+
+        structure_formed = []
+        time = []
+
+        if len(geom_half) >= 1:
+            for y in range(len(new_criteria)):
+                for x in range(len(geom_half[0])):
+                    if eval(new_criteria[y]):
+                        structure_formed.append(list(stop_criteria.values())[y])
+                        # print('%s Formed at point %s' % (list(stop_criteria.values())[y], x))
+                        time.append(x)
+                        break
+
+        if len(structure_formed) >= 1:
+            first_formed = structure_formed[0]
+            time_first = time[0]
+            record_halves.append((first_formed, time_first))
+
+    return record_halves
+
+
+def impose_specific_stop_criteria(geoms_forward, geoms_backward):
     """
     Determines if and when particular products are formed along each half of a trajectory by imposing specific stop
     criteria, provided as a list.
     :param geoms_forward: geometric criteria along forward half of trajectory
     :param geoms_backward: geomtric criteria along backward half of trajectory
-    :param stop_criteria: list of criteria
     :return: record_halves: a record of what was formed first in each trajectory half and when
     """
     # Determine which product was made in each trajectory half
@@ -227,7 +266,7 @@ def impose_specific_stop_criteria(geoms_forward, geoms_backward, stop_criteria=N
     return record_halves
 
 
-def generate_data_table_all_trajs(trajectory_directory, index_list):
+def generate_data_table_all_trajs(trajectory_directory, index_list, geometric_parameters_list, stop_criteria):
 
     xyz_files = sorted(glob.glob(os.path.join(trajectory_directory, '*.xyz')))
     record = []
@@ -242,7 +281,8 @@ def generate_data_table_all_trajs(trajectory_directory, index_list):
         geoms_forward, geoms_backward = get_geometric_criteria(forward_cartesians, backward_cartesians, index_list)
 
         # Determine what structure was generated first in each half of a trajectory and when it was formed
-        record_halves = impose_specific_stop_criteria(geoms_forward, geoms_backward)
+        # record_halves = impose_specific_stop_criteria(geoms_forward, geoms_backward)
+        record_halves = impose_stop_criteria(geoms_forward, geoms_backward, geometric_parameters_list, stop_criteria)
 
         trajectory_names.append(trajectory_name)
         record.append(record_halves)
@@ -250,15 +290,47 @@ def generate_data_table_all_trajs(trajectory_directory, index_list):
     return trajectory_names, record
 
 
+def organize_data_table(trajectory_names, record, stop_criteria):
+    """
+    Organizes the data table of trajectory results to include column names and a "label" column that can be used to
+    count total number of particular trajectory outcomes.
+    :param trajectory_names: list of trajectory names
+    :param record: data table of trajectory results
+    :param stop_criteria: dictionary of stop criteria used to specify products made
+    :return: results_df: organized dataframe of results
+    """
+    # Store information about product made and timing (trajectory name, forward product made, time made, backward
+    # product made, time made)
+    products_df = pd.DataFrame(record, columns=['forward', 'backward'])
+    results_df = pd.DataFrame(trajectory_names, columns=['name'])
+    results_df[['forward product', 'forward time']] = products_df['forward'].apply(pd.Series)
+    results_df[['backward product', 'backward time']] = products_df['backward'].apply(pd.Series)
+
+    # Make "label" column in dataframe to be able to sort by outcome
+    results_df['label'] = ""
+
+    for i in range(len(results_df)):
+        for a in range(len(stop_criteria.values())):
+            for b in range(len(stop_criteria.values())):
+                if str(results_df['forward product'][i]) == str(list(stop_criteria.values())[a]) and str(
+                        results_df['backward product'][i]) == str(list(stop_criteria.values())[b]):
+                    results_df.loc[i, 'label'] = '%s to %s' % (
+                    list(stop_criteria.values())[b], list(stop_criteria.values())[a])
+            if results_df.loc[i, 'label'] == "":
+                results_df.loc[i, 'label'] = 'incomplete'
+
+    return results_df
+
+
 def sort_trajectories_into_folders(trajectory_directory, results_df):
 
     grouped_by_type = results_df.groupby('label')
 
     for key in list(grouped_by_type.groups.keys()):
-        if not os.path.exists(os.path.join(trajectory_directory, key)):
-            os.makedirs(os.path.join(trajectory_directory, key))
+        if not os.path.exists(os.path.join(trajectory_directory, key.replace(" ", "_"))):
+            os.makedirs(os.path.join(trajectory_directory, key.replace(" ", "_")))
         for traj_name in grouped_by_type.get_group(key)['name']:
             os.rename(os.path.join(trajectory_directory, traj_name + ".xyz"),
-                      os.path.join(trajectory_directory, key, traj_name + ".xyz"))
+                      os.path.join(trajectory_directory, key.replace(" ", "_"), traj_name + ".xyz"))
 
 
